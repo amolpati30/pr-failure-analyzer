@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 PR Failure Analyzer — Satellite QE
-Fetches open PRs, identifies PRT Jenkins build, analyzes failures.
+Fetches open PRs, identifies PRT Jenkins build, shows failed tests,
+and feeds the selected test to the test-failure-analyzer agent.
 
 USAGE:
   # Interactive wizard:
@@ -9,6 +10,9 @@ USAGE:
 
   # Non-interactive:
   python3 ~/pr-analyzer/pr_analyzer.py --repo SatelliteQE/robottelo --pr 21046
+
+  # Skip to specific test (1-based index, or 'all'):
+  python3 ~/pr-analyzer/pr_analyzer.py --repo SatelliteQE/robottelo --pr 21046 --test 2
 
   # Just list PRs:
   python3 ~/pr-analyzer/pr_analyzer.py --repo SatelliteQE/robottelo --list-prs
@@ -77,19 +81,6 @@ def ask_text(prompt, default=None):
         if raw:
             return raw
         print(f"  {RED}Value required.{RESET}")
-
-
-def ask_choice(prompt, choices, labels=None):
-    labels = labels or choices
-    print()
-    for i, label in enumerate(labels, 1):
-        print(f"  {BOLD}{i}{RESET}. {label}")
-    print()
-    while True:
-        raw = _tty_input(f"  {YELLOW}>>{RESET} {prompt} (1-{len(choices)}): ").strip()
-        if raw.isdigit() and 1 <= int(raw) <= len(choices):
-            return choices[int(raw) - 1]
-        print(f"  {RED}Invalid.{RESET} Enter 1–{len(choices)}.")
 
 # ─── Credentials ─────────────────────────────────────────────────────────────────
 
@@ -160,8 +151,8 @@ def jenkins_session():
         err(f"Expected in {JENKINS_CREDS_FILE} or JENKINS_USER/JENKINS_TOKEN env vars.")
         sys.exit(1)
     s = requests.Session()
-    s.auth    = (user, token)
-    s.verify  = False
+    s.auth   = (user, token)
+    s.verify = False
     return s
 
 
@@ -180,20 +171,16 @@ def jenkins_get(s, path, params=None):
 
 
 KNOWN_JOB_ALIASES = {
-    "test-robottelo":      "robottelo-pr-testing",
-    "robottelo":           "robottelo-pr-testing",
-    "robottelo-pr":        "robottelo-pr-testing",
+    "test-robottelo": "robottelo-pr-testing",
+    "robottelo":      "robottelo-pr-testing",
+    "robottelo-pr":   "robottelo-pr-testing",
 }
 
 
 def resolve_job_name(s, job_name):
-    """Resolve trigger alias to real Jenkins job name."""
     resolved = KNOWN_JOB_ALIASES.get(job_name, job_name)
     r = s.get(f"{JENKINS_BASE_URL}/job/{resolved}/api/json", params={"tree": "name"}, timeout=10)
-    if r.ok:
-        return resolved
-    # Fall back to original if alias didn't work either
-    return job_name
+    return resolved if r.ok else job_name
 
 
 def jenkins_console(s, job_name, build_number):
@@ -220,32 +207,24 @@ def jenkins_test_results(s, job_name, build_number):
         for case in suite.get("cases", []):
             if case.get("status") in ("FAILED", "REGRESSION"):
                 failed.append({
-                    "name":        case.get("name", ""),
-                    "class_name":  case.get("className", ""),
-                    "status":      case.get("status", ""),
-                    "error":       (case.get("errorDetails") or "").strip(),
-                    "stacktrace":  (case.get("errorStackTrace") or "").strip(),
-                    "duration":    round(case.get("duration", 0), 2),
+                    "name":       case.get("name", ""),
+                    "class_name": case.get("className", ""),
+                    "status":     case.get("status", ""),
+                    "error":      (case.get("errorDetails") or "").strip(),
+                    "stacktrace": (case.get("errorStackTrace") or "").strip(),
+                    "duration":   round(case.get("duration", 0), 2),
                 })
     return failed
 
 # ─── PRT parsing ─────────────────────────────────────────────────────────────────
 
 def extract_prt_info(comments):
-    """
-    Scan PR comments for trigger + PRT result blocks.
-    Returns dict with keys: job_name, build_number, build_status, pytest_args, test_result
-    """
     info_map = {}
     for comment in comments:
         body = comment["body"]
-
-        # Trigger comment: "trigger: test-robottelo"
         m = re.search(r"trigger:\s*(\S+)", body, re.IGNORECASE)
         if m:
             info_map["job_name"] = m.group(1).strip()
-
-        # PRT result block
         if "PRT Result" in body or "Build Number:" in body:
             m = re.search(r"Build Number:\s*(\d+)", body)
             if m:
@@ -259,25 +238,38 @@ def extract_prt_info(comments):
             m = re.search(r"Test Result\s*:\s*(.+)", body)
             if m:
                 info_map["test_result"] = m.group(1).strip()
-
     return info_map
 
 
-def extract_console_failures(console_text, max_lines=120):
-    """Pull the most relevant failure sections from the console log."""
+def extract_test_console_section(console_text, test_name):
+    """Extract the console log section relevant to a specific test name."""
     if not console_text:
         return ""
     lines = console_text.splitlines()
-    relevant = []
-    capture = False
-    for line in lines:
-        if any(kw in line for kw in ("FAILED", "ERROR", "AssertionError", "ERRORS", "short test summary")):
-            capture = True
-        if capture:
+    # Find the block around FAILED <test_name>
+    short_name = test_name.split("::")[-1] if "::" in test_name else test_name
+    relevant, capturing, count = [], False, 0
+    for i, line in enumerate(lines):
+        if short_name in line or (capturing and count < 80):
+            if not capturing:
+                start = max(0, i - 5)
+                relevant.extend(lines[start:i])
+                capturing = True
             relevant.append(line)
-        if len(relevant) >= max_lines:
+            count += 1
+        elif capturing and any(kw in line for kw in ("PASSED", "FAILED", "ERROR", "=====")):
+            relevant.append(line)
             break
-    return "\n".join(relevant)
+    # Also grab the short test summary section
+    in_summary = False
+    for line in lines:
+        if "short test summary" in line:
+            in_summary = True
+        if in_summary:
+            relevant.append(line)
+        if in_summary and "===" in line and "short test summary" not in line:
+            break
+    return "\n".join(relevant[:150])
 
 # ─── Display ─────────────────────────────────────────────────────────────────────
 
@@ -295,76 +287,105 @@ def print_prs(prs):
     print()
 
 
-def print_failed_tests(failed):
-    if not failed:
-        warn("No failed tests found in test report.")
-        return
-    print(f"\n  {BOLD}{'#':<4} {'Status':<12} {'Duration':>8}  Test{RESET}")
-    print(f"  {'-'*4} {'-'*12} {'-'*8}  {'-'*55}")
+def print_failed_tests_table(failed):
+    """Print numbered table of failed tests for interactive selection."""
+    layer_color = {"UI": CYAN, "API": BLUE, "CLI": GREEN}
+    print(f"\n  {BOLD}{'#':<4}  {'Layer':<5}  {'Status':<10}  {'Dur':>6}  {'Test Name'}{RESET}")
+    print(f"  {'─'*4}  {'─'*5}  {'─'*10}  {'─'*6}  {'─'*55}")
     for i, t in enumerate(failed, 1):
-        color = RED if t["status"] == "FAILED" else YELLOW
-        print(f"  {BOLD}{i:<4}{RESET} {color}{t['status']:<12}{RESET} {DIM}{t['duration']}s{RESET:>8}  {t['name']}")
-        dim(f"       {t['class_name']}")
+        parts  = t["class_name"].lower().split(".")
+        layer  = next((p.upper() for p in parts if p in ("ui", "api", "cli")), "???")
+        lcolor = layer_color.get(layer, DIM)
+        scolor = RED if t["status"] == "FAILED" else YELLOW
+        dur    = f"{t['duration']}s"
+        name   = t["name"]
+        if len(name) > 52:
+            name = name[:49] + "..."
+        print(f"  {BOLD}{i:<4}{RESET}  {lcolor}{layer:<5}{RESET}  {scolor}{t['status']:<10}{RESET}  {DIM}{dur:>6}{RESET}  {name}")
+        module = t["class_name"].split(".")[-1] if t["class_name"] else ""
+        if module:
+            print(f"  {'':4}  {'':5}  {'':10}  {'':6}  {DIM}{module}{RESET}")
         if t["error"]:
-            dim(f"       {t['error'][:120]}")
+            snippet = t["error"].splitlines()[0][:80] if t["error"] else ""
+            print(f"  {'':4}  {'':5}  {'':10}  {'':6}  {RED}{snippet}{RESET}")
+        print()
     print()
 
-# ─── Analysis output ─────────────────────────────────────────────────────────────
 
-def build_analysis_prompt(pr, pr_diff, prt, failed_tests, console_failures):
+def ask_test_selection(failed):
+    """Prompt user to pick one or more tests by index. Returns list of chosen tests."""
+    n = len(failed)
+    while True:
+        raw = _tty_input(
+            f"  {YELLOW}>>{RESET} Select test to analyze"
+            f" (1-{n}, comma-separated, or 'all'): "
+        ).strip().lower()
+        if raw == "all":
+            return failed
+        parts = [p.strip() for p in raw.split(",")]
+        indices = []
+        valid = True
+        for p in parts:
+            if p.isdigit() and 1 <= int(p) <= n:
+                indices.append(int(p) - 1)
+            else:
+                print(f"  {RED}Invalid choice '{p}'.{RESET} Enter numbers between 1 and {n}, or 'all'.")
+                valid = False
+                break
+        if valid and indices:
+            return [failed[i] for i in indices]
+
+# ─── Per-test analysis context ───────────────────────────────────────────────────
+
+def build_test_context(test, pr, pr_diff, prt, console_section):
+    """Build the structured context string passed to the test-failure-analyzer agent."""
     lines = [
         "=" * 70,
-        f"  PR FAILURE ANALYSIS — #{pr['number']}: {pr['title']}",
+        f"  TEST FAILURE CONTEXT",
         "=" * 70,
         "",
-        f"Repository : {pr['base']['repo']['full_name']}",
-        f"Author     : {pr['user']['login']}",
-        f"Branch     : {pr['head']['ref']} → {pr['base']['ref']}",
-        f"PR URL     : {pr['html_url']}",
+        f"PR             : #{pr['number']} — {pr['title']}",
+        f"Repository     : {pr['base']['repo']['full_name']}",
+        f"Author         : {pr['user']['login']}",
+        f"Branch         : {pr['head']['ref']} → {pr['base']['ref']}",
+        f"PR URL         : {pr['html_url']}",
+        "",
+        f"Jenkins Job    : {prt.get('job_name', 'unknown')}",
+        f"Build #        : {prt.get('build_number', 'unknown')}",
+        f"Build Status   : {prt.get('build_status', 'unknown')}",
+        f"Pytest command : {prt.get('pytest_args', '')}",
+        f"Overall result : {prt.get('test_result', '')}",
+        f"Jenkins URL    : {JENKINS_BASE_URL}/job/{prt.get('job_name','???')}/{prt.get('build_number','???')}/",
+        "",
+        "─── Failing Test ───────────────────────────────────────────────────────",
+        f"Name       : {test['name']}",
+        f"Class      : {test['class_name']}",
+        f"Status     : {test['status']}",
+        f"Duration   : {test['duration']}s",
+        "",
+        "─── Error Message ──────────────────────────────────────────────────────",
+        test["error"] or "(no error message captured)",
         "",
     ]
 
-    if prt:
+    if test["stacktrace"]:
         lines += [
-            "─── PRT / Jenkins ──────────────────────────────────────────────────────",
-            f"Job Name   : {prt.get('job_name', 'unknown')}",
-            f"Build #    : {prt.get('build_number', 'unknown')}",
-            f"Status     : {prt.get('build_status', 'unknown')}",
-            f"Pytest     : {prt.get('pytest_args', '')}",
-            f"Result     : {prt.get('test_result', '')}",
-            f"Jenkins URL: {JENKINS_BASE_URL}/job/{prt.get('job_name', '???')}/{prt.get('build_number', '???')}/",
+            "─── Stack Trace ────────────────────────────────────────────────────────",
+            test["stacktrace"],
+            "",
+        ]
+
+    if console_section:
+        lines += [
+            "─── Console Log Excerpt (test-specific) ────────────────────────────────",
+            console_section,
             "",
         ]
 
     lines += [
-        "─── Code Changes (diff) ────────────────────────────────────────────────",
-        pr_diff[:4000] if pr_diff else "(no diff available)",
+        "─── PR Code Changes (diff) ─────────────────────────────────────────────",
+        pr_diff[:5000] if pr_diff else "(no diff available)",
         "",
-    ]
-
-    if failed_tests:
-        lines += ["─── Failed Tests ───────────────────────────────────────────────────────"]
-        for i, t in enumerate(failed_tests, 1):
-            lines.append(f"\n[{i}] {t['class_name']}::{t['name']}")
-            lines.append(f"    Status   : {t['status']}")
-            lines.append(f"    Error    : {t['error']}")
-            if t["stacktrace"]:
-                lines.append(f"    Traceback:\n{t['stacktrace'][:800]}")
-        lines.append("")
-
-    if console_failures:
-        lines += [
-            "─── Console Log (failure excerpt) ──────────────────────────────────────",
-            console_failures,
-            "",
-        ]
-
-    lines += [
-        "─── Analysis Request ───────────────────────────────────────────────────",
-        "Please analyze the above PR diff and test failures, then:",
-        "1. Identify the root cause of each test failure.",
-        "2. Determine whether the failure is caused by the PR changes or pre-existing.",
-        "3. Suggest a specific, actionable fix with code examples where applicable.",
         "=" * 70,
     ]
 
@@ -376,10 +397,7 @@ def cmd_setup(args):
     print(f"\n{CYAN}{BOLD}  GitHub Token Setup{RESET}\n")
     print(f"  Get your token at: https://github.com/settings/tokens")
     print(f"  Required scopes: repo, read:org, read:user\n")
-    if args.gh_token:
-        token = args.gh_token
-    else:
-        token = _tty_input(f"  {YELLOW}>>{RESET} GitHub personal access token: ").strip()
+    token = args.gh_token or _tty_input(f"  {YELLOW}>>{RESET} GitHub personal access token: ").strip()
     if not token:
         err("Token cannot be empty.")
         sys.exit(1)
@@ -388,22 +406,18 @@ def cmd_setup(args):
 # ─── Main workflow ───────────────────────────────────────────────────────────────
 
 def run(args):
-    # Load GitHub token
     gh_token = load_github_token()
     if not gh_token:
         err("No GitHub token found.")
-        err("Run: python3 ~/pr-analyzer/pr_analyzer.py --setup  (or --setup --gh-token <tok>)")
+        err("Run: python3 ~/pr-analyzer/pr_analyzer.py --setup")
         sys.exit(1)
 
     gs = gh_session(gh_token)
     js = jenkins_session()
 
-    # Step 1: Repo
+    # ── Step 1: Repo ─────────────────────────────────────────────────────────────
     header("PR Failure Analyzer — Satellite QE")
-    if args.repo:
-        repo = args.repo
-    else:
-        repo = ask_text("GitHub repo (e.g. SatelliteQE/robottelo)", default="SatelliteQE/robottelo")
+    repo = args.repo or ask_text("GitHub repo", default="SatelliteQE/robottelo")
 
     info(f"Fetching open PRs for {BOLD}{repo}{RESET} ...")
     prs = gh_get(gs, f"/repos/{repo}/pulls", params={"state": "open", "per_page": 50, "sort": "updated"})
@@ -412,11 +426,10 @@ def run(args):
         sys.exit(1)
 
     print_prs(prs)
-
     if args.list_prs:
         return
 
-    # Step 2: PR number
+    # ── Step 2: PR number ────────────────────────────────────────────────────────
     if args.pr:
         pr_num = args.pr
     else:
@@ -427,15 +440,12 @@ def run(args):
             err("Invalid PR number.")
             sys.exit(1)
 
-    # Fetch PR detail
     pr = gh_get(gs, f"/repos/{repo}/pulls/{pr_num}")
     if not pr:
         err(f"PR #{pr_num} not found.")
         sys.exit(1)
-
     ok(f"PR #{pr_num}: {pr['title']}")
 
-    # Fetch diff
     info("Fetching PR diff ...")
     try:
         r = gs.get(pr["diff_url"], timeout=20)
@@ -445,49 +455,96 @@ def run(args):
         pr_diff = ""
         warn("Could not fetch diff.")
 
-    # Fetch comments to find PRT info
+    # ── Step 3: PRT / Jenkins ────────────────────────────────────────────────────
     info("Scanning PR comments for PRT results ...")
     comments = gh_get(gs, f"/repos/{repo}/issues/{pr_num}/comments", params={"per_page": 100}) or []
     prt = extract_prt_info(comments)
 
     if not prt:
         warn("No PRT trigger/result comment found on this PR.")
+        prt = {}
     else:
-        job   = prt.get("job_name", "?")
-        build = prt.get("build_number", "?")
+        job    = prt.get("job_name", "?")
+        build  = prt.get("build_number", "?")
         status = prt.get("build_status", "?")
         ok(f"PRT — Job: {BOLD}{job}{RESET}  Build: {BOLD}#{build}{RESET}  Status: {BOLD}{status}{RESET}")
 
-    # Step 3: Jenkins analysis
-    failed_tests    = []
-    console_failures = ""
+    failed_tests  = []
+    console_text  = None
 
     if prt.get("job_name") and prt.get("build_number"):
         job   = resolve_job_name(js, prt["job_name"])
         build = prt["build_number"]
-        prt["job_name"] = job  # update for output
-        jenkins_url = f"{JENKINS_BASE_URL}/job/{job}/{build}/"
-        info(f"Jenkins build: {jenkins_url}")
+        prt["job_name"] = job
 
-        info("Fetching test results from Jenkins ...")
+        info(f"Jenkins build: {JENKINS_BASE_URL}/job/{job}/{build}/")
+
+        info("Fetching structured test results ...")
         failed_tests = jenkins_test_results(js, job, build)
-        if failed_tests:
-            ok(f"Found {len(failed_tests)} failed test(s).")
-            print_failed_tests(failed_tests)
-        else:
-            warn("No structured test results — falling back to console log.")
 
         info("Fetching console log ...")
-        console_text     = jenkins_console(js, job, build)
-        console_failures = extract_console_failures(console_text)
+        console_text = jenkins_console(js, job, build)
+
+        if not failed_tests and not console_text:
+            warn("Build is too old — logs have been purged from Jenkins.")
+            warn("Analysis will be based on PR diff and PRT summary only.")
     else:
-        warn("Skipping Jenkins analysis (no build info found).")
+        warn("Skipping Jenkins analysis (no build info in PR comments).")
 
-    # Step 4: Print analysis prompt
-    header("Analysis Output")
-    prompt = build_analysis_prompt(pr, pr_diff, prt, failed_tests, console_failures)
-    print(prompt)
+    # ── Step 4: Test selection ───────────────────────────────────────────────────
+    selected_tests = []
 
+    if failed_tests:
+        header(f"Failed Tests — Build #{prt.get('build_number', '?')}")
+        print_failed_tests_table(failed_tests)
+
+        if args.test:
+            if str(args.test).lower() == "all":
+                selected_tests = failed_tests
+            else:
+                try:
+                    idx = int(args.test) - 1
+                    if 0 <= idx < len(failed_tests):
+                        selected_tests = [failed_tests[idx]]
+                    else:
+                        err(f"Test index {args.test} out of range (1–{len(failed_tests)}).")
+                        sys.exit(1)
+                except ValueError:
+                    err(f"Invalid --test value: {args.test}")
+                    sys.exit(1)
+        else:
+            selected_tests = ask_test_selection(failed_tests)
+    else:
+        # No structured results — use PRT summary + diff only
+        warn("No structured test results available. Outputting PRT + diff context.")
+        selected_tests = [None]
+
+    # ── Step 5: Output context for each selected test ────────────────────────────
+    header("Test Failure Context — for analysis agent")
+
+    if selected_tests and selected_tests[0] is None:
+        # Fallback: output what we have
+        fallback_context = build_test_context(
+            test={
+                "name":       prt.get("pytest_args", "unknown"),
+                "class_name": "",
+                "status":     prt.get("build_status", "UNKNOWN"),
+                "error":      prt.get("test_result", ""),
+                "stacktrace": "",
+                "duration":   0,
+            },
+            pr=pr, pr_diff=pr_diff, prt=prt,
+            console_section="",
+        )
+        print(fallback_context)
+        return
+
+    for test in selected_tests:
+        console_section = extract_test_console_section(console_text, test["name"]) if console_text else ""
+        context = build_test_context(test, pr, pr_diff, prt, console_section)
+        print(context)
+        if len(selected_tests) > 1:
+            print(f"\n{'─' * 70}\n")
 
 # ─── CLI ─────────────────────────────────────────────────────────────────────────
 
@@ -497,11 +554,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--setup",     action="store_true", help="Save GitHub token to config")
-    parser.add_argument("--gh-token",  metavar="TOKEN",     help="GitHub token (for --setup)")
-    parser.add_argument("--repo",      metavar="OWNER/REPO",help="GitHub repository")
-    parser.add_argument("--pr",        type=int,            help="PR number to analyze")
-    parser.add_argument("--list-prs",  action="store_true", help="List open PRs and exit")
+    parser.add_argument("--setup",    action="store_true",  help="Save GitHub token")
+    parser.add_argument("--gh-token", metavar="TOKEN",      help="GitHub token (for --setup)")
+    parser.add_argument("--repo",     metavar="OWNER/REPO", help="GitHub repository")
+    parser.add_argument("--pr",       type=int,             help="PR number to analyze")
+    parser.add_argument("--test",     metavar="N|all",      help="Test index to analyze (1-based) or 'all'")
+    parser.add_argument("--list-prs", action="store_true",  help="List open PRs and exit")
     args = parser.parse_args()
 
     if args.setup:
