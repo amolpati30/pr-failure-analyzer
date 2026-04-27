@@ -1,0 +1,29 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <value>
+          <list size="16">
+            <item index="0" class="java.lang.String" itemvalue="fastmcp" />
+            <item index="1" class="java.lang.String" itemvalue="PyGithub" />
+            <item index="2" class="java.lang.String" itemvalue="broker" />
+            <item index="3" class="java.lang.String" itemvalue="pytest-ibutsu" />
+            <item index="4" class="java.lang.String" itemvalue="fauxfactory" />
+            <item index="5" class="java.lang.String" itemvalue="dynaconf" />
+            <item index="6" class="java.lang.String" itemvalue="productmd" />
+            <item index="7" class="java.lang.String" itemvalue="pytest" />
+            <item index="8" class="java.lang.String" itemvalue="tenacity" />
+            <item index="9" class="java.lang.String" itemvalue="python-box" />
+            <item index="10" class="java.lang.String" itemvalue="wrapanapi" />
+            <item index="11" class="java.lang.String" itemvalue="cryptography" />
+            <item index="12" class="java.lang.String" itemvalue="requests" />
+            <item index="13" class="java.lang.String" itemvalue="deepdiff" />
+            <item index="14" class="java.lang.String" itemvalue="pytest-reportportal" />
+            <item index="15" class="java.lang.String" itemvalue="apypie" />
+          </list>
+        </value>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
